@@ -1,18 +1,17 @@
+import base64
+import json
 import logging
 import os
 import base64
-import json
+
 import requests
-
 from flask import Flask, request, jsonify
-
+from flask_cors import CORS
 from google.cloud import datastore
-from google.cloud import storage
-from google.cloud import vision
 from google.cloud import error_reporting
 from google.cloud import logging
-from google.cloud import translate_v2
-from flask_cors import CORS
+from google.cloud import storage
+from google.cloud import vision
 
 CLOUD_STORAGE_BUCKET = os.environ.get('CLOUD_STORAGE_BUCKET')
 
@@ -44,17 +43,13 @@ def homepage():
         info["types"] = image_entity.get("types", [])
         info["website"] = image_entity.get("website", "Unknown")
         info["wikipedia_extract"] = image_entity.get("wikipedia_extract", "Unknown")
+        info["audio"] = image_entity.get("audio", "Unknown")
         data.append(info)
 
     return jsonify(json.dumps(data)), 200, {
         'Access-Control-Allow-Origin': '*',
         'Access-Control-Allow-Headers': 'Content-Type',
     }
-
-
-@app.route('/muie', methods=['GET'])
-def muie():
-    return "aaa"
 
 
 def upload_photo_to_storage(photo, filename):
@@ -67,6 +62,22 @@ def upload_photo_to_storage(photo, filename):
     blob = bucket.blob(filename)
     blob.upload_from_string(
         base64.b64decode(photo), content_type="image/jpeg")
+
+    # Make the blob publicly viewable.
+    blob.make_public()
+    return blob.name, blob.public_url
+
+
+def upload_mp3_to_storage(audio, audioname):
+    # Create a Cloud Storage client.
+    storage_client = storage.Client()
+    # Get the bucket that the file will be uploaded to.
+    bucket = storage_client.get_bucket(CLOUD_STORAGE_BUCKET)
+
+    # Create a new blob and upload the file's content.
+    blob = bucket.blob(audioname)
+    blob.upload_from_string(
+        base64.b64decode(audio), content_type="audio/mpeg")
 
     # Make the blob publicly viewable.
     blob.make_public()
@@ -94,6 +105,23 @@ def get_landmark(name, logger):
         longitude = "Unknown"
         logger.log_text('No landmarks detected for ' + name)
     return description, latitude, longitude
+
+
+def get_text(name, logger):
+    # Create a Cloud Vision client.
+    vision_client = vision.ImageAnnotatorClient()
+
+    # Use the Cloud Vision client to detect a face for our image.
+    source_uri = 'gs://{}/{}'.format(CLOUD_STORAGE_BUCKET, name)
+    image = vision.types.Image(
+        source=vision.types.ImageSource(gcs_image_uri=source_uri))
+    text_annotations = vision_client.text_detection(image).text_annotations
+    if len(text_annotations) > 0:
+        text_object = text_annotations[0]
+        text = text_object.description
+    else:
+        text = "Unknown"
+    return text
 
 
 def get_place_id(description):
@@ -162,10 +190,26 @@ def get_wikipedia_extract(description):
 
 
 def translate_text(text, language):
+    data = dict()
+    data["q"] = text
+    data["target"] = language
+    data["key"] = 'AIzaSyCl9VWpSabxI5kyc1aLEXQ6oDSY7sJ2JYI'
+    response = requests.post("https://translation.googleapis.com/language/translate/v2", data).json()
+    response = response["data"]["translations"][0]["translatedText"]
+    return response
 
-    client = translate_v2.client.Client(target_language=language)
-    response = client.translate(text)
-    return response["translatedText"]
+
+def get_audio(text, language):
+    data = dict()
+    data["input"] = {"text": text}
+    data["voice"] = {"languageCode": language}
+    data["audioConfig"] = {"audioEncoding": "MP3"}
+    response = requests.post(
+        "https://texttospeech.googleapis.com/v1/text:synthesize?key=AIzaSyDvgTvCu9L8FYXckNZG2cn76-pKqsbj36w",
+        None, data).json()
+    with open("a.mp3", "wb") as f:
+        f.write(base64.b64decode(response["audioContent"]))
+    return response["audioContent"]
 
 
 @app.route('/upload_photo', methods=['GET', 'POST'])
@@ -174,6 +218,7 @@ def upload_photo():
     filename = request.json['filename']
     selected_language = request.json['language']
 
+    audio_language = selected_language
     selected_language = selected_language.split('-')[0]
     name, blob_public_url = upload_photo_to_storage(photo, filename)
 
@@ -197,7 +242,12 @@ def upload_photo():
     wikipedia_extract = get_wikipedia_extract(description)
     wikipedia_extract = translate_text(wikipedia_extract, selected_language)
 
-    entity = datastore.Entity(key, exclude_from_indexes=['wikipedia_extract'])
+    audio = get_audio(wikipedia_extract, audio_language)
+    audio_name = audio_language + description + ".mp3"
+    audio_name, audio_url = upload_mp3_to_storage(audio, audio_name)
+    audio = audio_url
+
+    entity = datastore.Entity(key, exclude_from_indexes=['wikipedia_extract', "audio"])
     entity['blob_name'] = name
     entity['image_public_url'] = blob_public_url
     entity['description'] = description
@@ -209,6 +259,7 @@ def upload_photo():
     entity["types"] = types
     entity["website"] = website
     entity["wikipedia_extract"] = wikipedia_extract
+    entity["audio"] = audio
 
     # Save the new entity to Datastore.
     datastore_client.put(entity)
@@ -224,6 +275,40 @@ def upload_photo():
     info["types"] = entity.get("types", [])
     info["website"] = entity.get("website", "Unknown")
     info["wikipedia_extract"] = entity.get("wikipedia_extract", "Unknown")
+    info["audio"] = audio
+
+    return jsonify(json.dumps(info)), 200, {
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Headers': 'Content-Type',
+    }
+
+
+@app.route('/upload_text_photo', methods=['GET', 'POST'])
+def upload_text_photo():
+    photo = request.json['file']
+    filename = request.json['filename']
+    selected_language = request.json['language']
+
+    audio_language = selected_language
+    selected_language = selected_language.split('-')[0]
+    name, blob_public_url = upload_photo_to_storage(photo, filename)
+
+    client = logging.Client()
+    logger = client.logger('log_name')
+
+    text = get_text(name, logger)
+
+    translated_text = translate_text(text, selected_language)
+
+    audio = get_audio(translated_text, audio_language)
+    audio_name = audio_language + name + ".mp3"
+    audio_name, audio_url = upload_mp3_to_storage(audio, audio_name)
+    audio = audio_url
+
+    info = dict()
+    info["original_text"] = text
+    info["translated_text"] = translated_text
+    info["audio"] = audio
 
     return jsonify(json.dumps(info)), 200, {
         'Access-Control-Allow-Origin': '*',
