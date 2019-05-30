@@ -6,4 +6,4 @@ runtime_config:
   python_version: 3
 
 env_variables:
-  CLOUD_STORAGE_BUCKET: back-end-t3.appspot.com
+  CLOUD_STORAGE_BUCKET: back-end-proiect-cloud.appspot.com
