@@ -11,22 +11,13 @@ from google.cloud import storage
 from google.cloud import vision
 from google.cloud import error_reporting
 from google.cloud import logging
-from google.cloud import translate
+from google.cloud import translate_v2
 from flask_cors import CORS
 
 CLOUD_STORAGE_BUCKET = os.environ.get('CLOUD_STORAGE_BUCKET')
 
 app = Flask(__name__)
 CORS(app)
-
-
-def remove_htlm_tags(html_input):
-    start = html_input.find('<')
-    while start >= 0:
-        stop = html_input.find('>') + 1
-        html_input = html_input[0:start] + html_input[stop:]
-        start = html_input.find('<')
-    return html_input
 
 
 @app.route('/')
@@ -43,16 +34,16 @@ def homepage():
     #     datastore_client.delete(datastore_client.key('Landmarks',image_entity["description"]))
     for index, image_entity in enumerate(image_entities):
         info = dict()
-        info["description"] = image_entity["description"]
-        info["latitude"] = image_entity["latitude"]
-        info["longitude"] = image_entity["longitude"]
-        info["url"] = image_entity["image_public_url"]
-        info['formatted_address'] = image_entity['formatted_address']
-        info["formatted_phone_number"] = image_entity["formatted_phone_number"]
-        info["international_phone_number"] = image_entity["international_phone_number"]
-        info["types"] = image_entity["types"]
-        info["website"] = image_entity["website"]
-        info["wikipedia_extract"] = image_entity["wikipedia_extract"]
+        info["description"] = image_entity.get("description", "Unknown")
+        info["latitude"] = image_entity.get("latitude", "Unknown")
+        info["longitude"] = image_entity.get("longitude", "Unknown")
+        info["url"] = image_entity.get("image_public_url", "Unknown")
+        info['formatted_address'] = image_entity.get("formatted_address", "Unknown")
+        info["formatted_phone_number"] = image_entity.get("formatted_phone_number", "Unknown")
+        info["international_phone_number"] = image_entity.get("international_phone_number", "Unknown")
+        info["types"] = image_entity.get("types", [])
+        info["website"] = image_entity.get("website", "Unknown")
+        info["wikipedia_extract"] = image_entity.get("wikipedia_extract", "Unknown")
         data.append(info)
 
     return jsonify(json.dumps(data)), 200, {
@@ -113,11 +104,17 @@ def get_place_id(description):
 
     response = requests.get("https://maps.googleapis.com/maps/api/place/findplacefromtext/json",
                             payload)
-    place_id = response.json()["candidates"][0]["place_id"]
+    response = response.json()
+    place_id = response.get("candidates", None)
+    if place_id is None or place_id == []:
+        return None
+    place_id = place_id[0]["place_id"]
     return place_id
 
 
 def get_details(place_id):
+    if place_id is None:
+        return "Unkown", "Unknown", "Unknown", [], "Unknown"
     payload = dict()
     payload["key"] = 'AIzaSyCl9VWpSabxI5kyc1aLEXQ6oDSY7sJ2JYI'
     payload["placeid"] = place_id
@@ -133,7 +130,18 @@ def get_details(place_id):
     return formatted_address, formatted_phone_number, international_phone_number, types, website
 
 
+def remove_htlm_tags(html_input):
+    start = html_input.find('<')
+    while start >= 0:
+        stop = html_input.find('>') + 1
+        html_input = html_input[0:start] + html_input[stop:]
+        start = html_input.find('<')
+    return html_input
+
+
 def get_wikipedia_extract(description):
+    if description is "Unknown":
+        return "Unknown"
     payload = dict()
     payload["action"] = "opensearch"
     payload["search"] = description
@@ -154,8 +162,9 @@ def get_wikipedia_extract(description):
 
 
 def translate_text(text, language):
-    client = translate.Client()
-    response = client.translate(text, target_language=language)
+
+    client = translate_v2.client.Client(target_language=language)
+    response = client.translate(text)
     return response["translatedText"]
 
 
@@ -163,7 +172,9 @@ def translate_text(text, language):
 def upload_photo():
     photo = request.json['file']
     filename = request.json['filename']
+    selected_language = request.json['language']
 
+    selected_language = selected_language.split('-')[0]
     name, blob_public_url = upload_photo_to_storage(photo, filename)
 
     client = logging.Client()
@@ -184,9 +195,7 @@ def upload_photo():
     formatted_address, formatted_phone_number, international_phone_number, types, website = get_details(place_id)
 
     wikipedia_extract = get_wikipedia_extract(description)
-    wikipedia_extract = translate_text(wikipedia_extract, "ro")
-
-    print(wikipedia_extract)
+    wikipedia_extract = translate_text(wikipedia_extract, selected_language)
 
     entity = datastore.Entity(key, exclude_from_indexes=['wikipedia_extract'])
     entity['blob_name'] = name
@@ -205,7 +214,16 @@ def upload_photo():
     datastore_client.put(entity)
 
     info = dict()
-    info["public_url"] = blob_public_url
+    info["description"] = entity.get("description", "Unknown")
+    info["latitude"] = entity.get("latitude", "Unknown")
+    info["longitude"] = entity.get("longitude", "Unknown")
+    info["url"] = entity.get("image_public_url", "Unknown")
+    info['formatted_address'] = entity.get("formatted_address", "Unknown")
+    info["formatted_phone_number"] = entity.get("formatted_phone_number", "Unknown")
+    info["international_phone_number"] = entity.get("international_phone_number", "Unknown")
+    info["types"] = entity.get("types", [])
+    info["website"] = entity.get("website", "Unknown")
+    info["wikipedia_extract"] = entity.get("wikipedia_extract", "Unknown")
 
     return jsonify(json.dumps(info)), 200, {
         'Access-Control-Allow-Origin': '*',
